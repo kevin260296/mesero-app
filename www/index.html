@@ -59,6 +59,18 @@
   header .volver:active { transform: scale(0.96); }
   header .sub { font-size: 11.5px; color: #a0a0a0; margin: 2px 0 0; font-weight: 400; }
 
+  .status-conexion {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 11px; padding: 4px 8px; border-radius: 12px;
+    background: rgba(255,255,255,0.1); color: #a0a0a0;
+  }
+  .status-conexion.conectado { color: #4ade80; }
+  .status-conexion::before {
+    content: '●'; font-size: 8px; animation: parpadear 1.5s infinite;
+  }
+  .status-conexion.conectado::before { animation: none; }
+  @keyframes parpadear { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+
   .aviso {
     background: var(--aviso-fondo); color: var(--aviso-texto);
     font-size: 12px; padding: 9px 16px; line-height: 1.45;
@@ -404,6 +416,7 @@
     <h1 id="titulo">Gestor de Pedidos</h1>
     <p class="sub" id="subtitulo">Selecciona una mesa</p>
   </div>
+  <div class="status-conexion" id="statusConexion" title="Estado de conexión a Supabase">Conectando...</div>
   <button class="btn-logout" onclick="cerrarSesion()">Salir</button>
 </header>
 
@@ -771,7 +784,7 @@
     $("pantallaMesas").hidden = false;
     $("pantallaPedido").hidden = true;
     $("btnVolver").hidden = true;
-    $("titulo").textContent = "Comandero";
+    $("titulo").textContent = "Gestor de Pedidos";
     $("subtitulo").textContent = "Selecciona una mesa";
     $("barra").classList.remove("visible");
     mesaActiva = null;
@@ -1117,9 +1130,25 @@
   };
 
   // ==========================================================================
-  // Notificación de pedidos listos
+  // Notificación de pedidos listos + Manejo de conexión
   // ==========================================================================
   let suscripcionPedidos = null;
+  let estadoConexion = false;
+  let intentosReconexion = 0;
+  const MAX_REINTENTOS = 10;
+
+  function actualizarStatusConexion(conectado) {
+    const elem = $("statusConexion");
+    estadoConexion = conectado;
+    if (conectado) {
+      elem.textContent = "Conectado";
+      elem.classList.add("conectado");
+      intentosReconexion = 0;
+    } else {
+      elem.textContent = "Sin conexión";
+      elem.classList.remove("conectado");
+    }
+  }
 
   function reproducirSonido() {
     const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -1129,7 +1158,6 @@
     oscillator.connect(gain);
     gain.connect(audioCtx.destination);
 
-    // Dos beeps: sol (392 Hz) y do (523 Hz)
     oscillator.frequency.value = 392;
     gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
     gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.1);
@@ -1151,27 +1179,43 @@
 
   async function cargarPlatosListos() {
     if (!conectado) return;
-    const { data: detalles } = await db
-      .from("detalle_pedidos")
-      .select("id, pedido_id, producto_id, cantidad, estado")
-      .eq("estado", "listo")
-      .order("id");
+    try {
+      console.log("📥 Cargando platos listos...");
+      const { data: detalles, error } = await db
+        .from("detalle_pedidos")
+        .select("id, pedido_id, producto_id, cantidad, estado")
+        .eq("estado", "listo")
+        .order("id");
 
-    if (!detalles) return;
+      if (error) { console.error("❌ Error cargarPlatosListos:", error); return; }
+      if (!detalles) { console.log("⚠️ No hay detalles"); return; }
 
-    platosListos = [];
-    for (const d of detalles) {
-      const { data: prod } = await db.from("productos").select("nombre").eq("id", d.producto_id).single();
-      const { data: ped } = await db.from("pedidos").select("mesa_id").eq("id", d.pedido_id).single();
-      platosListos.push({
-        detalleId: d.id,
-        pedidoId: d.pedido_id,
-        mesaId: ped?.mesa_id,
-        nombre: prod?.nombre || "Producto",
-        cantidad: d.cantidad,
-      });
+      console.log(`📦 Encontrados ${detalles.length} platos listos`);
+
+      platosListos = [];
+      for (const d of detalles) {
+        try {
+          const { data: prod } = await db.from("productos").select("nombre").eq("id", d.producto_id).single();
+          const { data: ped } = await db.from("pedidos").select("mesa_id").eq("id", d.pedido_id).single();
+          platosListos.push({
+            detalleId: d.id,
+            pedidoId: d.pedido_id,
+            mesaId: ped?.mesa_id,
+            nombre: prod?.nombre || "Producto",
+            cantidad: d.cantidad,
+          });
+        } catch (e) {
+          console.error("Error procesando detalle:", e);
+        }
+      }
+
+      console.log(`✓ Renderizando ${platosListos.length} platos`);
+      renderPlatosListos();
+      actualizarStatusConexion(true);
+    } catch (err) {
+      console.error("❌ Error en cargarPlatosListos:", err);
+      actualizarStatusConexion(false);
     }
-    renderPlatosListos();
   }
 
   function renderPlatosListos() {
@@ -1214,28 +1258,111 @@
       return;
     }
 
-    const { error } = await db.from("detalle_pedidos").update({ estado: "pagado" }).eq("id", detalleId);
-    if (error) { console.error(error); toast("Error al marcar como recogido"); return; }
+    try {
+      const { error } = await db.from("detalle_pedidos").update({ estado: "pagado" }).eq("id", detalleId);
+      if (error) { console.error(error); toast("Error al marcar como recogido"); return; }
 
-    platosListos = platosListos.filter((p) => p.detalleId !== detalleId);
-    renderPlatosListos();
-    toast("✓ Plato recogido");
+      platosListos = platosListos.filter((p) => p.detalleId !== detalleId);
+      renderPlatosListos();
+      toast("✓ Plato recogido");
+      actualizarStatusConexion(true);
+    } catch (err) {
+      console.error(err);
+      toast("Error de conexión");
+      actualizarStatusConexion(false);
+    }
   }
 
-  function suscribirseAPedidosListos() {
-    if (!conectado || suscripcionPedidos) return;
+  async function suscribirseAPedidosListos() {
+    if (!conectado) { actualizarStatusConexion(false); return; }
+    if (suscripcionPedidos) return;
 
-    suscripcionPedidos = db
-      .channel("pedidos-listos")
-      .on("postgres_changes", { event: "UPDATE", schema: "public", table: "detalle_pedidos" }, (payload) => {
-        if (payload.new.estado === "listo") {
-          toast("🔔 ¡Un plato está listo!");
-          reproducirSonido();
-          cargarPlatosListos();
-        }
-      })
-      .subscribe();
+    try {
+      const channelId = "pedidos-listos-" + Math.random().toString(36).substr(2, 9);
+      console.log(`📡 Creando suscripción con ID: ${channelId}`);
+
+      suscripcionPedidos = db
+        .channel(channelId)
+        .on("postgres_changes", {
+          event: "UPDATE",
+          schema: "public",
+          table: "detalle_pedidos",
+          filter: "estado=eq.listo"
+        }, (payload) => {
+          console.log("🔔 Evento UPDATE recibido:", payload);
+          if (payload?.new?.estado === "listo") {
+            console.log("✓ Plato listo detectado");
+            toast("🔔 ¡Un plato está listo!");
+            reproducirSonido();
+            // Esperar 500ms para que Supabase actualice los datos
+            setTimeout(() => {
+              console.log("⏱️ Cargando platos listos después de delay...");
+              cargarPlatosListos();
+            }, 500);
+          }
+        })
+        .subscribe((status) => {
+          console.log(`[${channelId}] Estado de suscripción:`, status);
+          if (status === "SUBSCRIBED") {
+            actualizarStatusConexion(true);
+            console.log("✓ Suscripción ACTIVA a pedidos listos");
+          } else if (status === "CHANNEL_ERROR") {
+            actualizarStatusConexion(false);
+            console.error("❌ Error en canal de suscripción");
+            suscripcionPedidos = null;
+            setTimeout(() => reconectarSuscripcion(), 3000);
+          }
+        });
+    } catch (err) {
+      console.error("❌ Error al suscribirse:", err);
+      actualizarStatusConexion(false);
+      suscripcionPedidos = null;
+    }
   }
+
+  async function reconectarSuscripcion() {
+    if (!conectado || intentosReconexion >= MAX_REINTENTOS) return;
+
+    intentosReconexion++;
+    console.log(`🔄 Intento de reconexión ${intentosReconexion}/${MAX_REINTENTOS}`);
+
+    if (suscripcionPedidos) {
+      try {
+        await suscripcionPedidos.unsubscribe();
+      } catch (err) {
+        console.error("Error al desuscribirse:", err);
+      }
+      suscripcionPedidos = null;
+    }
+
+    await suscribirseAPedidosListos();
+  }
+
+  // Polling cada 10 segundos como respaldo (por si la suscripción falla)
+  setInterval(async () => {
+    if (!conectado) return;
+    console.log("🔄 Polling: verificando platos listos...");
+    await cargarPlatosListos();
+  }, 10000);
+
+  // Heartbeat cada 30 segundos para verificar conexión
+  setInterval(async () => {
+    if (!conectado) return;
+    try {
+      const { data } = await db.from("mesas").select("id").limit(1);
+      if (!data) {
+        actualizarStatusConexion(false);
+        reconectarSuscripcion();
+      } else if (!estadoConexion) {
+        actualizarStatusConexion(true);
+        reconectarSuscripcion();
+      }
+    } catch (err) {
+      console.error("Heartbeat error:", err);
+      actualizarStatusConexion(false);
+      reconectarSuscripcion();
+    }
+  }, 30000);
 
   // ==========================================================================
   // Cobrar
