@@ -1150,70 +1150,72 @@
     }
   }
 
+  // Un solo AudioContext reutilizado (cada llamada creaba uno nuevo y el navegador
+  // limita cuántos puede haber), y un oscilador por tono: un oscilador sólo admite
+  // start() una vez, así que antes el segundo tono lanzaba error y la vibración
+  // de la línea siguiente nunca llegaba a ejecutarse.
+  let audioCtx = null;
+
   function reproducirSonido() {
-    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const oscillator = audioCtx.createOscillator();
-    const gain = audioCtx.createGain();
-
-    oscillator.connect(gain);
-    gain.connect(audioCtx.destination);
-
-    oscillator.frequency.value = 392;
-    gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.1);
-
-    oscillator.start(audioCtx.currentTime);
-    oscillator.stop(audioCtx.currentTime + 0.1);
-
-    oscillator.frequency.setValueAtTime(523, audioCtx.currentTime + 0.15);
-    gain.gain.setValueAtTime(0.3, audioCtx.currentTime + 0.15);
-    gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.35);
-
-    oscillator.start(audioCtx.currentTime + 0.15);
-    oscillator.stop(audioCtx.currentTime + 0.35);
+    try {
+      audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+      if (audioCtx.state === "suspended") audioCtx.resume();
+      [[392, 0], [523, 0.15]].forEach(([frecuencia, retraso]) => {
+        const t0 = audioCtx.currentTime + retraso;
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.frequency.value = frecuencia;
+        gain.gain.setValueAtTime(0.3, t0);
+        gain.gain.exponentialRampToValueAtTime(0.01, t0 + 0.2);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start(t0);
+        osc.stop(t0 + 0.2);
+      });
+    } catch (err) {
+      console.warn("No se pudo reproducir el aviso sonoro:", err);
+    }
 
     if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
   }
 
   let platosListos = [];
+  let cargaListosVigente = 0;
+  let listosYaPintados = false;
 
   async function cargarPlatosListos() {
     if (!conectado) return;
+    const turno = ++cargaListosVigente;
     try {
-      console.log("📥 Cargando platos listos...");
-      const { data: detalles, error } = await db
+      // Una sola consulta: línea + nombre del plato + mesa del pedido. Se excluyen
+      // los pedidos ya cobrados para que no queden platos "listos" fantasma.
+      const { data, error } = await db
         .from("detalle_pedidos")
-        .select("id, pedido_id, producto_id, cantidad, estado")
+        .select("id, pedido_id, cantidad, productos(nombre), pedidos!inner(mesa_id, estado)")
         .eq("estado", "listo")
+        .neq("pedidos.estado", "pagado")
         .order("id");
 
-      if (error) { console.error("❌ Error cargarPlatosListos:", error); return; }
-      if (!detalles) { console.log("⚠️ No hay detalles"); return; }
+      if (turno !== cargaListosVigente) return;   // ya hay una carga más reciente en camino
+      if (error) { console.error("Error cargarPlatosListos:", error); actualizarStatusConexion(false); return; }
 
-      console.log(`📦 Encontrados ${detalles.length} platos listos`);
+      const nuevos = (data || []).map((d) => ({
+        detalleId: d.id,
+        pedidoId: d.pedido_id,
+        mesaId: d.pedidos?.mesa_id,
+        nombre: d.productos?.nombre || "Producto",
+        cantidad: d.cantidad,
+      }));
 
-      platosListos = [];
-      for (const d of detalles) {
-        try {
-          const { data: prod } = await db.from("productos").select("nombre").eq("id", d.producto_id).single();
-          const { data: ped } = await db.from("pedidos").select("mesa_id").eq("id", d.pedido_id).single();
-          platosListos.push({
-            detalleId: d.id,
-            pedidoId: d.pedido_id,
-            mesaId: ped?.mesa_id,
-            nombre: prod?.nombre || "Producto",
-            cantidad: d.cantidad,
-          });
-        } catch (e) {
-          console.error("Error procesando detalle:", e);
-        }
+      // Sólo se repinta si algo cambió (el sondeo corre cada 10 s)
+      if (!listosYaPintados || JSON.stringify(nuevos) !== JSON.stringify(platosListos)) {
+        platosListos = nuevos;
+        renderPlatosListos();
+        listosYaPintados = true;
       }
-
-      console.log(`✓ Renderizando ${platosListos.length} platos`);
-      renderPlatosListos();
       actualizarStatusConexion(true);
     } catch (err) {
-      console.error("❌ Error en cargarPlatosListos:", err);
+      console.error("Error en cargarPlatosListos:", err);
       actualizarStatusConexion(false);
     }
   }
@@ -1341,7 +1343,6 @@
   // Polling cada 10 segundos como respaldo (por si la suscripción falla)
   setInterval(async () => {
     if (!conectado) return;
-    console.log("🔄 Polling: verificando platos listos...");
     await cargarPlatosListos();
   }, 10000);
 
@@ -1377,6 +1378,11 @@
       try {
         if (pedido.pedidoId) {
           await db.from("pedidos").update({ estado: "pagado", total }).eq("id", pedido.pedidoId);
+          // Las líneas también pasan a pagado, si no un plato "listo" sin recoger
+          // seguiría avisando como pendiente de un pedido que ya se cobró.
+          await db.from("detalle_pedidos").update({ estado: "pagado" }).eq("pedido_id", pedido.pedidoId);
+          platosListos = platosListos.filter((p) => p.pedidoId !== pedido.pedidoId);
+          renderPlatosListos();
         }
         await db.from("mesas").update({ estado: "disponible" }).eq("id", mesaActiva.id);
       } catch (err) {
