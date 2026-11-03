@@ -492,40 +492,75 @@
 
 <script>
   // ==========================================================================
-  // LOGIN SIMPLE (Contraseña: "mesero")
+  // LOGIN con Supabase Auth
+  // La cuenta de el mesero se valida en la base de datos. El rol viaja dentro del
+  // token (app_metadata.rol) y las políticas RLS lo exigen en cada consulta, así que
+  // sin iniciar sesión no se puede leer ni escribir ningún pedido.
   // ==========================================================================
-  const CONTRASENA_MESERO = "mesero";
+  const EMAIL_CUENTA = "mesero@enchiladas.pe";
+  const ROL_CUENTA = "mesero";
+  let sesionActiva = false;
 
-  function verificarPassword() {
-    const pwd = document.getElementById("passwordInput").value;
-    if (pwd === CONTRASENA_MESERO) {
-      localStorage.setItem("mesero-logueado", "true");
-      document.getElementById("loginOverlay").hidden = true;
-    } else {
-      document.getElementById("loginError").textContent = "❌ Contraseña incorrecta";
-      document.getElementById("passwordInput").value = "";
-    }
-  }
-
-  function cerrarSesion() {
-    localStorage.removeItem("mesero-logueado");
+  function mostrarLogin(mensaje) {
+    sesionActiva = false;
     document.getElementById("loginOverlay").hidden = false;
     document.getElementById("passwordInput").value = "";
-    document.getElementById("loginError").textContent = "";
+    document.getElementById("loginError").textContent = mensaje || "";
+    document.getElementById("passwordInput").focus();
   }
 
-  function verificarSesion() {
-    if (localStorage.getItem("mesero-logueado") === "true") {
-      document.getElementById("loginOverlay").hidden = true;
-    } else {
-      document.getElementById("loginOverlay").hidden = false;
-      document.getElementById("passwordInput").focus();
+  function entrar() {
+    sesionActiva = true;
+    document.getElementById("loginOverlay").hidden = true;
+    iniciarApp();
+  }
+
+  async function verificarPassword() {
+    const pwd = document.getElementById("passwordInput").value;
+    if (!pwd) return;
+    if (!conectado) { mostrarLogin("Sin conexión a la base de datos"); return; }
+
+    const boton = document.querySelector("#loginOverlay button");
+    boton.disabled = true;
+    try {
+      const { data, error } = await db.auth.signInWithPassword({ email: EMAIL_CUENTA, password: pwd });
+      if (error) {
+        if (error.status === 429) mostrarLogin("⏳ Demasiados intentos. Espera unos minutos.");
+        else if (error.name === "AuthRetryableFetchError") mostrarLogin("Sin conexión. Revisa el internet.");
+        else mostrarLogin("❌ Contraseña incorrecta");
+        return;
+      }
+      if (data.user?.app_metadata?.rol !== ROL_CUENTA) {
+        await db.auth.signOut();
+        mostrarLogin("❌ Esta cuenta no tiene permiso para el mesero");
+        return;
+      }
+      entrar();
+    } finally {
+      boton.disabled = false;
     }
+  }
+
+  // Cierra la sesión en Supabase y recarga: limpia pantalla, temporizadores y canales
+  async function cerrarSesion() {
+    try { await db.auth.signOut(); } catch (e) { /* sin conexión: igual se recarga */ }
+    location.reload();
+  }
+
+  async function verificarSesion() {
+    if (!conectado) { mostrarLogin("Sin conexión a la base de datos"); return; }
+    const { data } = await db.auth.getSession();
+    if (data.session?.user?.app_metadata?.rol === ROL_CUENTA) entrar();
+    else mostrarLogin();
   }
 
   document.addEventListener("DOMContentLoaded", () => {
     document.getElementById("passwordInput").addEventListener("keypress", (e) => {
       if (e.key === "Enter") verificarPassword();
+    });
+    // Si la sesión caduca o se cierra en otra pestaña, vuelve a pedir la contraseña
+    db.auth.onAuthStateChange((evento) => {
+      if (evento === "SIGNED_OUT" && sesionActiva) location.reload();
     });
     verificarSesion();
   });
@@ -1342,13 +1377,13 @@
 
   // Polling cada 10 segundos como respaldo (por si la suscripción falla)
   setInterval(async () => {
-    if (!conectado) return;
+    if (!conectado || !sesionActiva) return;
     await cargarPlatosListos();
   }, 10000);
 
   // Heartbeat cada 30 segundos para verificar conexión
   setInterval(async () => {
-    if (!conectado) return;
+    if (!conectado || !sesionActiva) return;
     try {
       const { data } = await db.from("mesas").select("id").limit(1);
       if (!data) {
@@ -1403,12 +1438,16 @@
   // ==========================================================================
   // Arranque
   // ==========================================================================
-  (async function init() {
+  // Se llama una sola vez, cuando el login (o la sesión guardada) es válido
+  let appIniciada = false;
+  async function iniciarApp() {
+    if (appIniciada) return;
+    appIniciada = true;
     await cargarDatos();
     renderMesas();
     await cargarPlatosListos();
     suscribirseAPedidosListos();
-  })();
+  }
 </script>
 
 </body>
