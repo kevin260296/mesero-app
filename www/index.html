@@ -707,9 +707,15 @@
   async function cargarDatos() {
     if (!conectado) { $("aviso").hidden = false; return; }
 
-    const { data: m } = await db.from("mesas").select("*").order("numero_mesa");
-    const { data: c } = await db.from("categorias").select("*").order("orden");
-    const { data: p } = await db.from("productos").select("*").eq("disponible", true).order("orden");
+    // Las tres consultas salen a la vez: en datos móviles cada una tarda ~1 s
+    const [r1, r2, r3] = await Promise.all([
+      db.from("mesas").select("*").order("numero_mesa"),
+      db.from("categorias").select("*").order("orden"),
+      db.from("productos").select("*").eq("disponible", true).order("orden"),
+    ]);
+    const { data: m } = r1, { data: c } = r2, { data: p } = r3;
+    const fallo = r1.error || r2.error || r3.error;
+    if (fallo) toast("No se pudieron cargar los datos: " + (fallo.message || fallo));
 
     if (m && m.length) mesas = m;
     if (c && c.length) categorias = c;
@@ -1144,11 +1150,12 @@
       (insertadas || []).forEach((d, i) => { nuevasLineas[i].detalleId = d.id; });
       pedido.lineas.push(...nuevasLineas);
 
-      await db.from("pedidos")
-        .update({ total: totalDeMesa(mesaActiva.id) })
-        .eq("id", pedido.pedidoId);
-
-      await db.from("mesas").update({ estado: "ocupada" }).eq("id", mesaActiva.id);
+      // Total y estado de la mesa no dependen entre sí: van juntos
+      const [rTotal, rMesa] = await Promise.all([
+        db.from("pedidos").update({ total: totalDeMesa(mesaActiva.id) }).eq("id", pedido.pedidoId),
+        db.from("mesas").update({ estado: "ocupada" }).eq("id", mesaActiva.id),
+      ]);
+      if (rTotal.error || rMesa.error) throw (rTotal.error || rMesa.error);
       mesaActiva.estado = "ocupada";
 
       borrador.clear();
@@ -1158,7 +1165,7 @@
       toast("✓ Comanda enviada a cocina");
     } catch (err) {
       console.error(err);
-      toast("Error al enviar la comanda");
+      toast("Error al enviar la comanda: " + (err.message || err));
     } finally {
       btn.disabled = false;
     }
